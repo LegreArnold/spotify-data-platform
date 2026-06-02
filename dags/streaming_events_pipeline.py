@@ -97,7 +97,22 @@ with DAG(
         (lpush) que le DAG consomme avec rpop/lrange.
         Discutez avec l'équipe Infra & P2P de la stratégie choisie.
         """
-        raise NotImplementedError("TODO : implémenter consume_from_redis()")
+        import redis, os, json
+        r = redis.from_url(os.getenv('REDIS_URL', 'redis://redis:6379/1'), decode_responses=True)
+        listening, p2p = [], []
+        for item in r.lrange("listening_events_buffer", 0, -1):
+            try:
+                listening.append(json.loads(item))
+            except Exception:
+                pass
+        for item in r.lrange("p2p_network_events_buffer", 0, -1):
+            try:
+                p2p.append(json.loads(item))
+            except Exception:
+                pass
+        r.delete("listening_events_buffer", "p2p_network_events_buffer")
+        print(f"Consommé: {len(listening)} listening events, {len(p2p)} p2p events")
+        return {"listening": listening, "p2p_network": p2p}
 
     @task(task_id="validate_events")
     def validate_events(raw_events: dict, **context) -> dict:
@@ -114,7 +129,24 @@ with DAG(
             4. Invalides → INSERT dans dead_letter_events avec error_type="validation"
             5. Retourner {"valid_listening": [...], "valid_p2p": [...], "errors": N}
         """
-        raise NotImplementedError("TODO : implémenter validate_events()")
+        import json
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
+        REQUIRED = ["event_id", "user_id", "track_id", "timestamp", "duration_ms"]
+        valid_listening, errors = [], []
+        for event in raw_events.get("listening", []):
+            if all(k in event for k in REQUIRED) and event.get("duration_ms", 0) > 0:
+                valid_listening.append(event)
+            else:
+                errors.append(event)
+        if errors:
+            hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+            conn = hook.get_conn(); cur = conn.cursor()
+            for err in errors:
+                cur.execute("INSERT INTO dead_letter_events (original_topic, payload, error_type, error_message) VALUES (%s,%s,%s,%s)",
+                    ("redis_listening_events", json.dumps(err), "validation", "champ obligatoire manquant"))
+            conn.commit(); cur.close(); conn.close()
+        print(f"Valides: {len(valid_listening)} | Invalides DLQ: {len(errors)}")
+        return {"valid_listening": valid_listening, "valid_p2p": raw_events.get("p2p_network", []), "errors": len(errors)}
 
     @task(task_id="enrich_events")
     def enrich_events(validated: dict, **context) -> list:
@@ -130,7 +162,24 @@ with DAG(
 
         Hint : faire une seule requête PostgreSQL avec IN clause plutôt qu'une par event.
         """
-        raise NotImplementedError("TODO : implémenter enrich_events()")
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
+        events = validated["valid_listening"]
+        if not events:
+            return []
+        track_ids = list({e["track_id"] for e in events})
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        conn = hook.get_conn(); cur = conn.cursor()
+        cur.execute("SELECT id::text, title, artist_id::text, genre FROM tracks WHERE id::text = ANY(%s)", (track_ids,))
+        tracks_map = {r[0]: {"track_title": r[1], "artist_id": r[2], "genre": r[3]} for r in cur.fetchall()}
+        cur.close(); conn.close()
+        enriched = []
+        for event in events:
+            info = tracks_map.get(event["track_id"])
+            if info:
+                event.update(info)
+                enriched.append(event)
+        print(f"Enrichis: {len(enriched)}/{len(events)} events")
+        return enriched
 
     @task(task_id="store_to_parquet")
     def store_to_parquet(enriched_events: list, **context) -> str:
@@ -148,7 +197,30 @@ with DAG(
 
         Hint : pyarrow.parquet.write_table() + boto3 pour l'upload
         """
-        raise NotImplementedError("TODO : implémenter store_to_parquet()")
+        import os, io, json, boto3
+        from datetime import datetime
+        if not enriched_events:
+            return "no_events"
+        run_id = context["run_id"].replace(":", "_").replace("+", "_")
+        now = datetime.utcnow()
+        date_str = now.strftime("%Y-%m-%d")
+        hour_str = now.strftime("%H")
+        try:
+            import pandas as pd
+            df = pd.DataFrame(enriched_events)
+            buf = io.BytesIO()
+            df.to_parquet(buf, index=False)
+            buf.seek(0)
+            content, ext = buf.read(), "parquet"
+        except ImportError:
+            content = "\n".join(json.dumps(e) for e in enriched_events).encode()
+            ext = "jsonl"
+        s3 = boto3.client('s3', endpoint_url=os.getenv('MINIO_ENDPOINT', 'http://minio:9000'),
+            aws_access_key_id='minioadmin', aws_secret_access_key='minioadmin')
+        key = f"listening_events/date={date_str}/hour={hour_str}/part-{run_id}.{ext}"
+        s3.put_object(Bucket='spotify-parquet', Key=key, Body=content)
+        print(f"Stocké: s3://spotify-parquet/{key} ({len(enriched_events)} events)")
+        return key
 
     @task(task_id="upsert_to_postgres")
     def upsert_to_postgres(enriched_events: list, **context) -> dict:
@@ -163,7 +235,27 @@ with DAG(
 
         Hint : utiliser executemany() avec des tuples pour les performances.
         """
-        raise NotImplementedError("TODO : implémenter upsert_to_postgres()")
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
+        if not enriched_events:
+            return {"inserted": 0, "skipped": 0}
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        conn = hook.get_conn(); cur = conn.cursor()
+        inserted = 0
+        for e in enriched_events:
+            try:
+                cur.execute("""INSERT INTO listening_events
+                    (id, user_id, track_id, timestamp, duration_ms, device_type, geo_country, completed, event_source)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING""",
+                    (e["event_id"], e["user_id"], e["track_id"], e["timestamp"],
+                     e["duration_ms"], e.get("device_type"), e.get("geo_country"),
+                     e.get("completed", False), e.get("event_source", "p2p")))
+                inserted += cur.rowcount
+            except Exception as ex:
+                print(f"Skip event {e.get('event_id')}: {ex}")
+                conn.rollback()
+        conn.commit(); cur.close(); conn.close()
+        print(f"Inséré: {inserted}/{len(enriched_events)}")
+        return {"inserted": inserted, "skipped": len(enriched_events) - inserted}
 
     # ── Orchestration ─────────────────────────────────────────
     raw       = consume_from_redis()

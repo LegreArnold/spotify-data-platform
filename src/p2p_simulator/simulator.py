@@ -102,10 +102,28 @@ class P2PSimulator:
         # Peers actifs simulés
         self.active_peers = [str(uuid.uuid4()) for _ in range(n_peers)]
 
+        # Charger les vrais tracks depuis PostgreSQL
+        self.tracks = self._load_catalog()
+
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
 
         logger.info(f"Simulateur démarré | mode={mode} | peers={n_peers} | rate={events_per_second} evt/s")
+
+    def _load_catalog(self) -> list:
+        import glob, json
+        try:
+            tracks = []
+            for f in glob.glob("data/labels/*.json"):
+                with open(f, "r", encoding="utf-8") as fp:
+                    catalog = json.load(fp)
+                    tracks.extend(catalog.get("tracks", []))
+            if tracks:
+                logger.info(f"Catalogue chargé: {len(tracks)} tracks depuis data/labels/")
+                return [{"id": t["id"], "title": t["title"], "duration_ms": t["duration_ms"]} for t in tracks]
+        except Exception as e:
+            logger.warning(f"Catalogue introuvable, utilisation SAMPLE_TRACKS: {e}")
+        return SAMPLE_TRACKS
 
     def run(self):
         """Boucle principale : génère et publie des événements en continu."""
@@ -158,8 +176,7 @@ class P2PSimulator:
         En mode "late_events" (Phase 2) :
             - timestamp décalé de -5 à -30 minutes dans le passé
         """
-        track = random.choice(SAMPLE_TRACKS)
-
+        track = random.choice(self.tracks)
 
         duration_ms = random.randint(30_000, track["duration_ms"])
         event = {
@@ -239,6 +256,8 @@ class P2PSimulator:
         """
         try:
             self.redis.publish(channel, payload)
+            self.redis.lpush(channel + "_buffer", payload)
+            self.redis.ltrim(channel + "_buffer", 0, 9999)
         except Exception as e:
             logger.error(f"Redis indisponible sur {channel} : {e}")
 
