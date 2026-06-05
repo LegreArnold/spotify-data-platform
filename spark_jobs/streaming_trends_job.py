@@ -23,6 +23,7 @@ TODO :
     [ ] Écrire les résultats dans PostgreSQL et Redis
 """
 
+import json
 import os
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -97,19 +98,23 @@ def create_spark_session() -> SparkSession:
 def read_kafka_stream(spark: SparkSession):
     """
     Lit le topic Kafka `listening_events` en streaming.
-
-    TODO :
-        1. Utiliser spark.readStream.format("kafka")
-        2. Configurer kafka.bootstrap.servers, subscribe, startingOffsets
-        3. Caster la colonne "value" (bytes) en string
-        4. Parser le JSON avec from_json() et LISTENING_EVENT_SCHEMA
-        5. Caster la colonne "timestamp" (string ISO) en TimestampType
-        6. Renommer en "event_time" pour les fenêtres temporelles
-
-    Returns:
-        DataFrame streaming avec colonnes typées
     """
-    raise NotImplementedError("TODO : implémenter read_kafka_stream()")
+    raw_df = (
+        spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+        .option("subscribe", KAFKA_TOPIC)
+        .option("startingOffsets", "latest")
+        .load()
+    )
+
+    parsed_df = raw_df.select(
+        F.col("key").cast("string"),
+        F.from_json(F.col("value").cast("string"), LISTENING_EVENT_SCHEMA).alias("data"),
+    ).select("data.*")
+
+    events_df = parsed_df.withColumn("event_time", F.to_timestamp("timestamp"))
+    return events_df
 
 
 # ─────────────────────────────────────────────────────────────
@@ -119,34 +124,82 @@ def read_kafka_stream(spark: SparkSession):
 def compute_top_tracks_tumbling(events_df):
     """
     Top 10 des tracks par tumbling window de 5 minutes.
-
-    TODO :
-        1. groupBy(window("event_time", "5 minutes"), "track_id")
-        2. agg(count("*").alias("stream_count"), countDistinct("user_id").alias("unique_listeners"))
-        3. Output mode : "update" (on met à jour au fur et à mesure)
-        4. Écrire dans PostgreSQL table realtime_top_tracks
-
-    Hint : pour écrire dans PostgreSQL depuis Spark Streaming,
-    utiliser foreachBatch() et df.write.jdbc() dans le batch.
     """
-    raise NotImplementedError("TODO : implémenter compute_top_tracks_tumbling()")
+    def write_batch(df, batch_id):
+        if df.rdd.isEmpty():
+            return
+        jdbc_url = POSTGRES_URL
+        df.write.jdbc(url=jdbc_url, table="realtime_top_tracks", mode="append", properties=POSTGRES_PROPS)
+
+    top_tracks = (
+        events_df
+        .withWatermark("event_time", "10 minutes")
+        .groupBy(F.window("event_time", "5 minutes"), "track_id")
+        .agg(
+            F.count("*").alias("stream_count"),
+            F.countDistinct("user_id").alias("unique_listeners"),
+        )
+        .select(
+            F.col("window.start").alias("window_start"),
+            F.col("window.end").alias("window_end"),
+            "track_id",
+            "stream_count",
+            "unique_listeners",
+        )
+    )
+
+    query = (
+        top_tracks.writeStream
+        .outputMode("update")
+        .foreachBatch(write_batch)
+        .option("checkpointLocation", CHECKPOINT_PATH + "/top_tracks")
+        .start()
+    )
+    return query
 
 
 def compute_genre_listeners_sliding(events_df, catalog_df):
     """
     Listeners uniques par genre en sliding window (15 min glissant toutes les 5 min).
-
-    TODO :
-        1. Joindre events_df avec catalog_df (stream-static join sur track_id)
-           pour récupérer le genre du morceau
-        2. groupBy(window("event_time", "15 minutes", "5 minutes"), "genre")
-        3. agg(countDistinct("user_id").alias("unique_listeners"))
-        4. Écrire dans Redis (clé "genre_listeners:live") via foreachBatch
-           Utiliser redis-py dans le batch
-
-    Hint : charger le catalogue PostgreSQL comme DataFrame statique avec spark.read.jdbc()
     """
-    raise NotImplementedError("TODO : implémenter compute_genre_listeners_sliding()")
+    if catalog_df is None:
+        return None
+
+    joined = events_df.join(catalog_df.select("id", "genre"), events_df.track_id == catalog_df.id, "left")
+    sliding = (
+        joined
+        .withWatermark("event_time", "20 minutes")
+        .groupBy(F.window("event_time", "15 minutes", "5 minutes"), "genre")
+        .agg(F.countDistinct("user_id").alias("unique_listeners"))
+        .select(
+            F.col("window.start").alias("window_start"),
+            F.col("window.end").alias("window_end"),
+            "genre",
+            "unique_listeners",
+        )
+    )
+
+    def write_genre_batch(df, batch_id):
+        import redis as redis_py
+
+        if df.rdd.isEmpty():
+            return
+
+        redis_client = redis_py.Redis(host="redis", port=6379, db=1, decode_responses=True)
+        genre_scores = {
+            row["genre"]: row["unique_listeners"]
+            for row in df.collect()
+        }
+        redis_client.set("genre_listeners:live", json.dumps(genre_scores))
+
+    query = (
+        sliding.writeStream
+        .outputMode("update")
+        .foreachBatch(write_genre_batch)
+        .option("checkpointLocation", CHECKPOINT_PATH + "/genre_listeners")
+        .start()
+    )
+    return query
 
 
 # ─────────────────────────────────────────────────────────────
