@@ -26,8 +26,12 @@ from typing import Optional
 
 import redis
 
-# Phase 2 — décommenter quand Kafka est prêt
-# from confluent_kafka import Producer
+try:
+    from confluent_kafka import Producer
+    KAFKA_AVAILABLE = True
+except ImportError:
+    Producer = None
+    KAFKA_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,18 +90,26 @@ class P2PSimulator:
         n_peers: int = 10,
         events_per_second: float = 5.0,
         mode: str = "normal",
+        publish_to_kafka: bool = False,
     ):
         self.n_peers = n_peers
         self.events_per_second = events_per_second
         self.mode = mode
         self.running = True
         self.event_count = 0
+        self.publish_to_kafka = publish_to_kafka and KAFKA_AVAILABLE
 
         # Connexion Redis
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
 
         # Phase 2 — Kafka producer
-        # self.kafka_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
+        self.kafka_producer = None
+        if self.publish_to_kafka:
+            try:
+                self.kafka_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
+            except Exception as exc:
+                logger.warning(f"Impossible de créer le producer Kafka : {exc}")
+                self.publish_to_kafka = False
 
         # Peers actifs simulés
         self.active_peers = [str(uuid.uuid4()) for _ in range(n_peers)]
@@ -160,32 +172,28 @@ class P2PSimulator:
         """
         track = random.choice(SAMPLE_TRACKS)
 
-
+        event_time = datetime.utcnow()
         duration_ms = random.randint(30_000, track["duration_ms"])
+
+        if self.mode == "fraud" and random.random() < 0.3:
+            duration_ms = random.randint(100, 4999)
+
+        if self.mode == "late_events" and random.random() < 0.4:
+            delay_minutes = random.randint(5, 30)
+            event_time = datetime.utcnow() - timedelta(minutes=delay_minutes)
+
         event = {
             "event_id":    str(uuid.uuid4()),
             "user_id":     random.choice(SAMPLE_USERS),
             "track_id":    track["id"],
             "source_peer": random.choice(self.active_peers),
-            "timestamp":   datetime.utcnow().isoformat() + "Z",
-            "duration_ms":  duration_ms,
-            "device_type":  random.choice(DEVICE_TYPES),
-            "geo_country":  random.choice(GEO_COUNTRIES),
-            "completed":    duration_ms > 30_000,
+            "timestamp":   event_time.isoformat() + "Z",
+            "duration_ms": duration_ms,
+            "device_type": random.choice(DEVICE_TYPES),
+            "geo_country": random.choice(GEO_COUNTRIES),
+            "completed":   duration_ms > 30_000,
             "event_source": random.choice(EVENT_SOURCES),
         }
-
-
-        # Mode fraud (Phase 2) — décommenter
-        # if self.mode == "fraud" and random.random() < 0.3:
-        #     event["duration_ms"] = random.randint(100, 4999)
-        #     event["completed"] = False
-
-        # Mode late_events (Phase 2) — décommenter
-        # if self.mode == "late_events" and random.random() < 0.4:
-        #     delay_minutes = random.randint(5, 30)
-        #     ts = datetime.utcnow() - timedelta(minutes=delay_minutes)
-        #     event["timestamp"] = ts.isoformat() + "Z"
 
         return event
 
@@ -228,29 +236,38 @@ class P2PSimulator:
         channel = TOPICS[topic_key]
 
         self._publish_to_redis(channel, payload)
-        # Phase 2 — décommenter
-        # self._publish_to_kafka(channel, event.get("user_id", ""), payload)
+        if self.publish_to_kafka and self.kafka_producer is not None:
+            self._publish_to_kafka(channel, event.get("user_id", ""), payload)
 
     def _publish_to_redis(self, channel: str, payload: str):
         """
-        TODO : publier payload dans le channel Redis via pub/sub.
-        Utiliser self.redis.publish(channel, payload)
-        Gérer l'exception si Redis est indisponible (log + skip).
+        Publie le payload dans le channel Redis via pub/sub.
+        Gère l'exception si Redis est indisponible.
         """
         try:
             self.redis.publish(channel, payload)
         except Exception as e:
             logger.error(f"Redis indisponible sur {channel} : {e}")
 
+    def _publish_to_kafka(self, topic: str, key: str, payload: str):
+        """
+        Publie le payload dans le topic Kafka.
+        """
+        if self.kafka_producer is None:
+            logger.warning("Kafka non disponible ou non configuré")
+            return
 
-    # def _publish_to_kafka(self, topic: str, key: str, payload: str):
-    #     """
-    #     TODO Phase 2 : publier payload dans le topic Kafka.
-    #     - key     : utilisé pour le partitionnement (user_id ou peer_id)
-    #     - acks    : 'all' pour la durabilité
-    #     - Gérer le callback de confirmation (delivery_report)
-    #     """
-    #     raise NotImplementedError("TODO Phase 2 : implémenter _publish_to_kafka()")
+        def delivery_report(err, msg):
+            if err is not None:
+                logger.error(f"Erreur Kafka livraison {msg.topic()} [{msg.partition()}]: {err}")
+            else:
+                logger.debug(f"Message Kafka livré : {msg.topic()} [{msg.partition()}]")
+
+        try:
+            self.kafka_producer.produce(topic, key=key.encode("utf-8") if key else None, value=payload.encode("utf-8"), on_delivery=delivery_report)
+            self.kafka_producer.poll(0)
+        except Exception as exc:
+            logger.error(f"Erreur publication Kafka sur {topic} : {exc}")
 
     def _shutdown(self, signum, frame):
         logger.info(f"Arrêt du simulateur (signal {signum}) — {self.event_count} événements publiés")
@@ -268,12 +285,14 @@ def main():
     parser.add_argument("--mode",   type=str,   default="normal",
                         choices=["normal", "fraud", "late_events", "chaos"],
                         help="Mode de simulation")
+    parser.add_argument("--kafka", action="store_true", help="Publier également les événements sur Kafka")
     args = parser.parse_args()
 
     simulator = P2PSimulator(
         n_peers=args.peers,
         events_per_second=args.rate,
         mode=args.mode,
+        publish_to_kafka=args.kafka,
     )
     simulator.run()
 
